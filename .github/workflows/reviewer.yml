@@ -7,6 +7,9 @@ on:
 jobs:
   ai-review:
     runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,7 +28,7 @@ jobs:
       - name: Ask DeepSeek v4-flash
         id: ai
         env:
-          API_KEY: ${{ secrets.llm_api_key }}   # 使用你定义的 secret 名
+          API_KEY: ${{ secrets.llm_api_key }}
         run: |
           RESPONSE=$(curl -s https://api.deepseek.com/v1/chat/completions \
             -H "Content-Type: application/json" \
