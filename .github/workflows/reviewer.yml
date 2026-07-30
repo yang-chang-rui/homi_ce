@@ -31,8 +31,10 @@ jobs:
           API_KEY: ${{ secrets.llm_api_key }}
         run: |
           set -e
-          # 调用 API，设置超时 60 秒，失败时捕获错误
-          RESPONSE=$(curl -s --max-time 60 -w "%{http_code}" https://api.deepseek.com/v1/chat/completions \
+
+          # 调用 API，将响应体写入临时文件，状态码单独获取
+          curl -s --max-time 60 -o response_body -w "%{http_code}" \
+            https://api.deepseek.com/v1/chat/completions \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $API_KEY" \
             -d "$(jq -n \
@@ -51,33 +53,36 @@ jobs:
                 ],
                 temperature: 0.1,
                 max_tokens: 256
-              }')" 2>&1 || true)
+              }')" \
+            > http_code.txt
 
-          # 分离 HTTP 状态码和响应体
-          HTTP_CODE="${RESPONSE: -3}"
-          BODY="${RESPONSE%???}"
+          HTTP_CODE=$(cat http_code.txt)
+          echo "HTTP状态码: $HTTP_CODE"
 
-          # 检查 HTTP 状态码是否为 200
+          # 检查状态码
           if [ "$HTTP_CODE" -ne 200 ]; then
-            echo "API 调用失败，HTTP 状态码: $HTTP_CODE"
-            echo "响应内容: $BODY"
+            echo "API调用失败，HTTP状态码: $HTTP_CODE"
+            echo "响应内容:"
+            cat response_body
             echo "allowed=false" >> $GITHUB_OUTPUT
             echo "reason=DeepSeek API 调用失败 (HTTP $HTTP_CODE)" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # 验证响应是否为合法 JSON
-          if ! echo "$BODY" | jq -e . >/dev/null 2>&1; then
-            echo "API 响应不是有效 JSON: $BODY"
+          # 验证响应体是否为有效 JSON
+          if ! jq -e . response_body >/dev/null 2>&1; then
+            echo "响应不是有效的JSON:"
+            cat response_body
             echo "allowed=false" >> $GITHUB_OUTPUT
-            echo "reason=DeepSeek 响应格式错误" >> $GITHUB_OUTPUT
+            echo "reason=DeepSeek 返回格式错误" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           # 提取内容
-          CONTENT=$(echo "$BODY" | jq -r '.choices[0].message.content')
-          if [ -z "$CONTENT" ] || [ "$CONTENT" = "null" ]; then
+          CONTENT=$(jq -r '.choices[0].message.content // ""' response_body)
+          if [ -z "$CONTENT" ]; then
             echo "未获取到有效内容"
+            cat response_body
             echo "allowed=false" >> $GITHUB_OUTPUT
             echo "reason=DeepSeek 返回内容为空" >> $GITHUB_OUTPUT
             exit 0
@@ -89,6 +94,9 @@ jobs:
 
           echo "allowed=$ALLOWED" >> $GITHUB_OUTPUT
           echo "reason=$REASON" >> $GITHUB_OUTPUT
+
+          # 调试信息
+          echo "AI 审查结论: allowed=$ALLOWED, reason=$REASON"
 
       - name: Set merge check status
         id: set_status
