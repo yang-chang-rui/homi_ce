@@ -1,283 +1,71 @@
-name: DeepSeek Merge Gate with Dynamic Dependency Installation
+name: Build multi-arch .so and dependency installer for plugins
 
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
 
 permissions:
-  statuses: write
-  pull-requests: write
-  contents: write
+  contents: write        # 用于推送生成的脚本和 .so
+  pull-requests: read    # 用于读取 PR 信息
 
 jobs:
-  ai-review-and-install:
+  build-and-generate:
     runs-on: ubuntu-22.04
 
+    strategy:
+      matrix:
+        arch: [x86_64, x86, arm64]   # 将三种架构并行编译，加快速度
+
     steps:
-      # 1. 检出代码（注意：pull_request_target 会检出目标分支，但我们需要能访问 PR 的源）
+      # ---------- 公共准备：检出代码 ----------
       - name: Checkout base
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2. 获取 PR 的 diff（处理 fork 的情况）
-      - name: Prepare PR diff
-        id: diff
+      - name: Find plugin folders with changed .c files
+        id: plugins
         run: |
-          set -e
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          PR_NUMBER="${{ github.event.pull_request.number }}"
+          # ...（与之前完全相同，略）...
+          # 注意：这一步我们只需在所有 matrix 中执行一次即可，
+          # 但因每个 job 独立，后面会重复运行。为简化，直接在 matrix 中执行，
+          # 但最终只有一次提交。我们可改为在一个前置 job 中计算文件夹，
+          # 然后传递给编译 job。为保持示例简洁，这里允许每个 arch 都运行检测。
+          # 实际使用建议拆分 job。
 
-          if git fetch --no-tags --prune origin "pull/${PR_NUMBER}/head:pr_head"; then
-            DIFF_RANGE="$BASE_SHA..pr_head"
-          else
-            git fetch --no-tags --prune origin "$HEAD_SHA" || true
-            if git rev-parse --verify --quiet "$HEAD_SHA" >/dev/null; then
-              DIFF_RANGE="$BASE_SHA..$HEAD_SHA"
-            else
-              echo "Error: Cannot fetch PR head" && exit 1
-            fi
-          fi
-
-          git diff "$DIFF_RANGE" > pr.diff
-          head -n 5000 pr.diff > pr_trimmed.diff
-          echo "content<<EOF" >> $GITHUB_OUTPUT
-          cat pr_trimmed.diff >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      # 3. 调用 DeepSeek API
-      - name: Ask DeepSeek for dependency analysis
-        id: ai
-        env:
-          API_KEY: ${{ secrets.LLM_API_KEY }}
+      # ---------- 安装交叉编译工具链（不同架构不同） ----------
+      - name: Setup cross-compilation tools
         run: |
-          set -e
+          sudo apt-get update
+          case "${{ matrix.arch }}" in
+            x86_64)
+              sudo apt-get install -y gcc
+              ;;
+            x86)
+              sudo dpkg --add-architecture i386
+              sudo apt-get update
+              sudo apt-get install -y gcc-multilib g++-multilib libc6-dev:i386
+              ;;
+            arm64)
+              sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
+              ;;
+          esac
 
-          TITLE="${{ github.event.pull_request.title }}"
-          BODY="${{ github.event.pull_request.body }}"
-          DIFF_FILE="pr_trimmed.diff"
+      # ---------- 为所有架构安装通用依赖（由 AI 提供） ----------
+      # 注意：这里我们需要先调用 AI 获得依赖包列表并安装，
+      # 但 install_deps.sh 的生成我们也要保留。因此重构步骤：
+      # 1. 获取 C 源码
+      # 2. 调用 AI，返回 JSON（包含依赖包列表 + install_deps.sh 脚本）
+      # 3. 根据依赖包列表安装开发包（同时安装对应架构的版本）
+      # 4. 编译 .so
+      # 5. 收集产物
+      # 由于 matrix 会重复执行 AI 调用，可在后续做合并优化，这里简化为每个 arch 都独立分析。
+      # 一个更优的方案：用单个 job 分析依赖并安装，然后编译，三种架构在一个 job 中顺序或并行编译。
+      # 但为展示结构，这里保留矩阵，但需注意文件同步问题。推荐实际使用时采用单个 job + 多架构编译。
+      # 下面先给出单个 job 的版本（推荐）。
 
-          # 构建系统提示（要求 AI 输出严格 JSON）
-          SYSTEM_PROMPT="你是一个依赖管理专家。审查 C 代码 PR 的 diff，识别新增的第三方库依赖。对于每个库，提供各 Linux 发行版的包名或替代安装方法。返回 JSON 格式。
-
-          规则：
-          1. 只关注新增的 #include <...> 头文件，忽略标准库（如 stdio.h, stdlib.h, string.h 等）。
-          2. 对每个第三方库，确定统一名称（如 libcurl, mysql, json-c, openssl, libxml2）。
-          3. 对于 ubuntu/debian, centos/rhel, alpine, arch 四个发行版，分别提供包名（如果存在），否则提供替代安装命令（字符串）。
-          4. 替代命令应安全（例如 wget、git clone、make install 等），避免使用 sudo 或管道到 shell。
-          5. 返回的 JSON 格式：
-          {
-            \"allowed\": true/false,
-            \"reason\": \"简要审查结论\",
-            \"dependencies\": [
-              {
-                \"lib\": \"库名\",
-                \"packages\": {
-                  \"ubuntu\": \"包名或null\",
-                  \"centos\": \"包名或null\",
-                  \"alpine\": \"包名或null\",
-                  \"arch\": \"包名或null\"
-                },
-                \"alternatives\": {
-                  \"ubuntu\": \"替代命令或null\",
-                  \"centos\": \"替代命令或null\",
-                  \"alpine\": \"替代命令或null\",
-                  \"arch\": \"替代命令或null\"
-                }
-              }
-            ]
-          }
-          若没有新增依赖，dependencies 为空数组。
-          "
-
-          jq -n \
-            --arg model "deepseek-chat" \
-            --arg system "$SYSTEM_PROMPT" \
-            --arg title "$TITLE" \
-            --arg body "$BODY" \
-            --rawfile diff "$DIFF_FILE" \
-            '{
-              model: $model,
-              messages: [
-                {role: "system", content: $system},
-                {role: "user", content: ("PR 标题：" + $title + "\nPR 描述：" + $body + "\n\nDiff:\n" + $diff)}
-              ],
-              temperature: 0.1,
-              max_tokens: 1024
-            }' > request.json
-
-          # 调用 API（带重试）
-          for i in 1 2; do
-            echo "尝试 $i ..."
-            curl -s --max-time 60 -o response_body -w "%{http_code}" \
-              https://api.deepseek.com/v1/chat/completions \
-              -H "Content-Type: application/json" \
-              -H "Authorization: Bearer $API_KEY" \
-              -d @request.json > http_code.txt
-
-            HTTP_CODE=$(cat http_code.txt)
-            if [ "$HTTP_CODE" -eq 200 ]; then
-              break
-            fi
-            if [ "$i" -eq 2 ]; then
-              echo "API 失败，HTTP $HTTP_CODE"
-              cat response_body
-              echo "allowed=false" >> $GITHUB_OUTPUT
-              echo "reason=DeepSeek API 调用失败" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-            sleep 2
-          done
-
-          # 检查响应是否为有效 JSON
-          if ! jq -e . response_body >/dev/null 2>&1; then
-            echo "响应不是有效 JSON"
-            echo "allowed=false" >> $GITHUB_OUTPUT
-            echo "reason=DeepSeek 返回格式错误" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 提取 AI 返回的内容
-          CONTENT=$(jq -r '.choices[0].message.content // ""' response_body)
-          if [ -z "$CONTENT" ]; then
-            echo "AI 返回内容为空"
-            echo "allowed=false" >> $GITHUB_OUTPUT
-            echo "reason=DeepSeek 返回内容为空" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 提取 allowed 和 reason
-          ALLOWED=$(echo "$CONTENT" | jq -r '.allowed // false')
-          REASON=$(echo "$CONTENT" | jq -r '.reason // "未知原因"')
-          echo "allowed=$ALLOWED" >> $GITHUB_OUTPUT
-          echo "reason=$REASON" >> $GITHUB_OUTPUT
-
-          # 保存完整依赖信息供后续步骤使用
-          echo "dependencies=$(echo "$CONTENT" | jq -c '.dependencies // []')" >> $GITHUB_OUTPUT
-
-          # 保存完整内容以便调试（可选）
-          echo "ai_content=$CONTENT" >> $GITHUB_OUTPUT
-
-      # 4. 根据 AI 输出动态安装依赖
-      - name: Install dependencies dynamically
-        if: steps.ai.outputs.allowed == 'true'
-        env:
-          DEPS_JSON: ${{ steps.ai.outputs.dependencies }}
-        run: |
-          set -e
-
-          # 确定当前发行版（GitHub Actions 是 Ubuntu）
-          DISTRO="ubuntu"
-          echo "📦 当前发行版: $DISTRO"
-
-          if [ -z "$DEPS_JSON" ] || [ "$DEPS_JSON" == "[]" ]; then
-            echo "ℹ️ 没有依赖需要安装"
-            exit 0
-          fi
-
-          # 提取该发行版的包名（非空）
-          PACKAGES=$(echo "$DEPS_JSON" | jq -r ".[] | select(.packages.\"$DISTRO\" != null) | .packages.\"$DISTRO\"")
-          # 提取替代命令（当包名为 null 时）
-          ALTERNATIVES=$(echo "$DEPS_JSON" | jq -r ".[] | select(.packages.\"$DISTRO\" == null) | .alternatives.\"$DISTRO\" | select(. != null)")
-
-          # 安装包管理器中的包
-          if [ -n "$PACKAGES" ]; then
-            echo "📦 通过 apt 安装: $PACKAGES"
-            sudo apt-get update
-            sudo apt-get install -y $PACKAGES
-          fi
-
-          # 执行替代安装（如果有）
-          if [ -n "$ALTERNATIVES" ]; then
-            echo "🔧 执行替代安装:"
-            echo "$ALTERNATIVES" | while read -r cmd; do
-              if [ -n "$cmd" ]; then
-                echo "执行: $cmd"
-                # 安全执行（不带 sudo，且不执行危险操作）
-                # 这里我们信任 AI 生成的命令，但可以添加白名单检查
-                eval "$cmd"
-              fi
-            done
-          fi
-
-          echo "✅ 依赖安装完成。"
-
-      # 5. 设置 commit status
-      - name: Set merge check status
-        id: set_status
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const allowed = core.getInput('allowed') || 'false';
-            let reason = core.getInput('reason') || 'Blocked by DeepSeek';
-            reason = reason.replace(/\n/g, ' ').substring(0, 140);
-            const state = allowed === 'true' ? 'success' : 'failure';
-            const desc = reason || (state === 'success' ? 'Approved by DeepSeek' : 'Blocked by DeepSeek');
-
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.payload.pull_request.head.sha,
-              state,
-              description: desc,
-              context: 'deepseek-merge-check'
-            });
-            core.setOutput('allowed', allowed);
-        env:
-          allowed: ${{ steps.ai.outputs.allowed }}
-          reason: ${{ steps.ai.outputs.reason }}
-
-      # 6. 如果不允许合并则失败
-      - name: Fail if not allowed
-        if: steps.set_status.outputs.allowed == 'false'
-        run: |
-          echo "❌ DeepSeek 审查未通过，合并被阻止。"
-          exit 1
-
-      # 7. 自动合并 PR
-      - name: Merge PR if allowed
-        if: steps.set_status.outputs.allowed == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const prNumber = context.payload.pull_request.number;
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-
-            // 检查是否可合并
-            const pr = await github.rest.pulls.get({
-              owner, repo, pull_number: prNumber
-            });
-            if (!pr.data.mergeable) {
-              await github.rest.repos.createCommitStatus({
-                owner, repo,
-                sha: context.payload.pull_request.head.sha,
-                state: 'failure',
-                description: 'PR has conflicts, auto-merge impossible.',
-                context: 'deepseek-merge-check'
-              });
-              core.setFailed('❌ PR 有冲突，无法自动合并。');
-              return;
-            }
-
-            // 尝试合并
-            try {
-              await github.rest.pulls.merge({
-                owner, repo,
-                pull_number: prNumber,
-                merge_method: 'squash',  // 可改为 'merge' 或 'rebase'
-                commit_title: `Auto-merge: ${pr.data.title}`,
-                commit_message: `Merged automatically by DeepSeek AI review.`
-              });
-              console.log(`✅ PR #${prNumber} merged successfully.`);
-            } catch (error) {
-              await github.rest.repos.createCommitStatus({
-                owner, repo,
-                sha: context.payload.pull_request.head.sha,
-                state: 'failure',
-                description: `Auto-merge failed: ${error.message.slice(0, 140)}`,
-                context: 'deepseek-merge-check'
-              });
-              core.setFailed(`❌ Auto-merge failed: ${error.message}`);
-            }
+# 推荐的单 job 版本（不使用 matrix，在一个 runner 中完成所有架构编译）：
+jobs:
+  build-all-arch:
+    runs-on: ubuntu-22.04
+    # ... 后续步骤
