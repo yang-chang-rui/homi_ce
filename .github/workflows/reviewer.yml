@@ -56,7 +56,6 @@ jobs:
           BODY="${{ github.event.pull_request.body }}"
           DIFF_FILE="pr_trimmed.diff"
 
-          # 使用 jq 构建请求体，避免 shell 转义问题
           jq -n \
             --arg model "deepseek-v4-flash" \
             --arg system "你是一个代码审查专家。根据 PR 的 diff 判断是否允许合并，重点检查：逻辑错误、安全漏洞、破坏性变更。只返回 JSON：{\"allowed\": true/false, \"reason\": \"原因\"}" \
@@ -117,26 +116,30 @@ jobs:
           echo "reason=$REASON" >> $GITHUB_OUTPUT
           echo "AI 结论: allowed=$ALLOWED, reason=$REASON"
 
-      - name: Set initial merge check status
+      - name: Set merge check status
         id: set_status
         uses: actions/github-script@v7
         with:
-          script: |
-            const allowed = '${{ steps.ai.outputs.allowed }}';
-            const reason = '${{ steps.ai.outputs.reason }}' || 'Blocked by DeepSeek';
-            const state = allowed === 'true' ? 'success' : 'failure';
-            const desc = reason ? reason.substring(0, 140) : (state === 'success' ? 'Approved by DeepSeek' : 'Blocked by DeepSeek');
+          allowed: ${{ steps.ai.outputs.allowed }}
+          reason: ${{ steps.ai.outputs.reason }}
+        script: |
+          const allowed = core.getInput('allowed', { required: true });
+          let reason = core.getInput('reason') || 'Blocked by DeepSeek';
+          // 移除换行符，防止破坏状态描述（最多140字符）
+          reason = reason.replace(/\n/g, ' ').substring(0, 140);
+          const state = allowed === 'true' ? 'success' : 'failure';
+          const desc = reason || (state === 'success' ? 'Approved by DeepSeek' : 'Blocked by DeepSeek');
 
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.payload.pull_request.head.sha,
-              state,
-              description: desc,
-              context: 'deepseek-merge-check'
-            });
+          await github.rest.repos.createCommitStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            sha: context.payload.pull_request.head.sha,
+            state,
+            description: desc,
+            context: 'deepseek-merge-check'
+          });
 
-            core.setOutput('allowed', allowed);
+          core.setOutput('allowed', allowed);
 
       - name: Fail workflow if not allowed
         if: steps.set_status.outputs.allowed == 'false'
@@ -148,52 +151,57 @@ jobs:
         if: steps.set_status.outputs.allowed == 'true'
         uses: actions/github-script@v7
         with:
-          script: |
-            const prNumber = context.payload.pull_request.number;
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
+          pr_number: ${{ github.event.pull_request.number }}
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          head_sha: ${{ github.event.pull_request.head.sha }}
+        script: |
+          const prNumber = parseInt(core.getInput('pr_number', { required: true }));
+          const owner = core.getInput('owner', { required: true });
+          const repo = core.getInput('repo', { required: true });
+          const headSha = core.getInput('head_sha', { required: true });
 
-            // 1. 检查是否可合并
-            const pr = await github.rest.pulls.get({
+          // 检查是否可合并
+          const pr = await github.rest.pulls.get({
+            owner,
+            repo,
+            pull_number: prNumber,
+          });
+
+          if (pr.data.mergeable === false) {
+            // 有冲突 → 更新状态为 failure
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: headSha,
+              state: 'failure',
+              description: 'PR has merge conflicts, auto-merge impossible.',
+              context: 'deepseek-merge-check'
+            });
+            core.setFailed('❌ PR has conflicts, auto-merge impossible.');
+            return;
+          }
+
+          // 尝试合并
+          try {
+            await github.rest.pulls.merge({
               owner,
               repo,
               pull_number: prNumber,
+              merge_method: 'merge',
+              commit_title: `Auto-merge: ${pr.data.title}`,
+              commit_message: `Merged automatically by DeepSeek AI review.`,
             });
-
-            if (pr.data.mergeable === false) {
-              // 有冲突 → 将状态改为 failure
-              await github.rest.repos.createCommitStatus({
-                owner,
-                repo,
-                sha: context.payload.pull_request.head.sha,
-                state: 'failure',
-                description: 'PR has merge conflicts, cannot auto-merge.',
-                context: 'deepseek-merge-check'
-              });
-              core.setFailed('❌ PR has conflicts, auto-merge impossible.');
-              return;
-            }
-
-            // 2. 尝试合并
-            try {
-              await github.rest.pulls.merge({
-                owner,
-                repo,
-                pull_number: prNumber,
-                merge_method: 'merge',
-                commit_title: `Auto-merge: ${pr.data.title}`,
-                commit_message: `Merged automatically by DeepSeek AI review.`,
-              });
-              console.log(`✅ PR #${prNumber} merged successfully.`);
-            } catch (error) {
-              // 合并失败（例如意外冲突、权限等） → 状态改为 failure
-              await github.rest.repos.createCommitStatus({
-                owner,
-                repo,
-                sha: context.payload.pull_request.head.sha,
-                state: 'failure',
-                description: 'Auto-merge failed: ' + error.message.slice(0, 140),
-                context: 'deepseek-merge-check'
-              });
-              core.setFailed(`❌ Auto-merge failed: ${error.message}`);
-            }
+            console.log(`✅ PR #${prNumber} merged successfully.`);
+          } catch (error) {
+            // 合并失败 → 更新状态为 failure
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: headSha,
+              state: 'failure',
+              description: `Auto-merge failed: ${error.message.slice(0, 140)}`,
+              context: 'deepseek-merge-check'
+            });
+            core.setFailed(`❌ Auto-merge failed: ${error.message}`);
+          }
