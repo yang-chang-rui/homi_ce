@@ -59,6 +59,7 @@ jobs:
           echo "reason=$REASON" >> $GITHUB_OUTPUT
 
       - name: Set merge check status
+        id: set_status
         uses: actions/github-script@v7
         with:
           script: |
@@ -75,3 +76,12 @@ jobs:
               description: desc,
               context: 'deepseek-merge-check'
             });
+
+            // 将结果传递给后续步骤
+            core.setOutput('allowed', allowed);
+
+      - name: Fail workflow if not allowed
+        if: steps.set_status.outputs.allowed == 'false'
+        run: |
+          echo "DeepSeek 审查未通过，合并被阻止。"
+          exit 1
