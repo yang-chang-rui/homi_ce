@@ -16,9 +16,16 @@ jobs:
         uses: aryanbrite/openrabbit@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          
+          # 改用 openrouter 提供商（因为 OpenRabbit 原生支持它）
+          llm_provider: openrouter
+          
+          # 指定 deepseek 模型（通过 OpenRouter 访问）
+          llm_model: deepseek/deepseek-v4-flash
+          
+          # 你的 API Key（这里用 OpenRouter 的 key，但如果你有 deepseek key，可能不能直接用，可改用下面说明）
           llm_api_key: ${{ secrets.LLM_API_KEY }}
-          llm_provider: openai
-          llm_model: deepseek-v4-flash
-          llm_base_url: https://api.deepseek.com/v1
-          tone_mode: balanced
+          
+          # 不需要 llm_api_url，因为 openrouter 使用默认地址
           review_mode: both
+          tone_mode: balanced
