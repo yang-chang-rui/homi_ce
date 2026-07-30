@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       statuses: write
-      pull-requests: write   # 用于启用 auto-merge
+      pull-requests: write   # 用于合并
 
     steps:
       - name: Checkout
@@ -17,7 +17,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # === 修复 diff 获取的核心步骤 ===
       - name: Get PR diff using SHA (with fallback)
         id: diff
         run: |
@@ -26,14 +25,11 @@ jobs:
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          # 1. 确保 base 存在
           git fetch --no-tags --prune origin "$BASE_SHA" || true
 
-          # 2. 尝试通过 refs/pull/N/head 获取 HEAD（对 fork 有效）
           if git fetch --no-tags --prune origin "pull/${PR_NUMBER}/head:pr_head"; then
             DIFF_RANGE="$BASE_SHA..pr_head"
           else
-            # 回退：直接尝试拉取 head SHA（可能已在本地）
             git fetch --no-tags --prune origin "$HEAD_SHA" || true
             if git rev-parse --verify --quiet "$HEAD_SHA" >/dev/null; then
               DIFF_RANGE="$BASE_SHA..$HEAD_SHA"
@@ -153,17 +149,35 @@ jobs:
           echo "❌ DeepSeek 审查未通过，合并被阻止。"
           exit 1
 
-      - name: Enable auto-merge if allowed
+      - name: Merge pull request if allowed
         if: steps.set_status.outputs.allowed == 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.payload.pull_request.number,
-              state: 'open',
-              auto_merge: {
-                merge_method: 'merge'   // 可改为 'squash' 或 'rebase'
-              }
+            const prNumber = context.payload.pull_request.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // 检查是否可合并（无冲突）
+            const pr = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber,
             });
+
+            if (pr.data.mergeable === false) {
+              core.setFailed('❌ PR has merge conflicts, cannot merge automatically.');
+              return;
+            }
+
+            // 执行合并
+            await github.rest.pulls.merge({
+              owner,
+              repo,
+              pull_number: prNumber,
+              merge_method: 'merge', // 或 'squash', 'rebase'
+              commit_title: `Auto-merge: ${pr.data.title}`,
+              commit_message: `Merged automatically by DeepSeek AI review.`,
+            });
+
+            console.log(`✅ PR #${prNumber} merged automatically.`);
