@@ -1,0 +1,13 @@
+📦 插件集合 / Plugin Collection
+
+这是一个插件集合，请在此处上传你为 homi 写的所有插件。  
+需要各位自行辨认是否可用。  
+谢谢所有用户的使用，记得给我点个 star 哦～ awa
+
+
+This is a plugin collection.  
+Please upload all the plugins you have written for homi here.
+
+Note: Everyone will need to verify for themselves whether they are usable.
+
+Thanks to all users for using this, and don't forget to give me a star ⭐, awa!
