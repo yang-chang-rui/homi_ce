@@ -16,10 +16,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get PR diff
+      - name: Get PR diff using SHA
         id: diff
         run: |
-          git diff origin/${{ github.base_ref }}...origin/${{ github.head_ref }} > pr.diff
+          # 使用 PR 的 base 和 head SHA，不依赖远程分支名
+          git diff ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} > pr.diff
           head -n 5000 pr.diff > pr_trimmed.diff
           echo "content<<EOF" >> $GITHUB_OUTPUT
           cat pr_trimmed.diff >> $GITHUB_OUTPUT
@@ -32,7 +33,7 @@ jobs:
         run: |
           set -e
 
-          # 生成请求体JSON文件，避免命令行参数长度限制
+          # 生成请求体 JSON 文件
           jq -n \
             --arg model "deepseek-v4-flash" \
             --arg system "你是一个代码审查专家。根据 PR 的 diff 判断是否允许合并，重点检查：逻辑错误、安全漏洞、破坏性变更。只返回 JSON：{\"allowed\": true/false, \"reason\": \"原因\"}" \
@@ -53,7 +54,7 @@ jobs:
 
           echo "请求体大小: $(wc -c < request.json) 字节"
 
-          # 调用 API，响应体写入文件，状态码单独获取
+          # 调用 API
           curl -s --max-time 60 -o response_body -w "%{http_code}" \
             https://api.deepseek.com/v1/chat/completions \
             -H "Content-Type: application/json" \
@@ -82,7 +83,7 @@ jobs:
             exit 0
           fi
 
-          # 验证是否为有效 JSON，若失败则打印部分内容以便调试
+          # 验证 JSON
           if ! jq -e . response_body >/dev/null 2>&1; then
             echo "响应不是有效的JSON，前200字符:"
             head -c 200 response_body
