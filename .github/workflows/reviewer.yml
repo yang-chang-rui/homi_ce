@@ -9,7 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       statuses: write
-      pull-requests: write   # 用于合并
+      pull-requests: write
+      contents: write
 
     steps:
       - name: Checkout
@@ -17,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get PR diff using SHA (with fallback)
+      - name: Get PR diff (robust for forks)
         id: diff
         run: |
           set -e
@@ -34,8 +35,7 @@ jobs:
             if git rev-parse --verify --quiet "$HEAD_SHA" >/dev/null; then
               DIFF_RANGE="$BASE_SHA..$HEAD_SHA"
             else
-              echo "Error: Cannot fetch PR head (pr #${PR_NUMBER}, sha ${HEAD_SHA})"
-              exit 1
+              echo "Error: Cannot fetch PR head" && exit 1
             fi
           fi
 
@@ -52,25 +52,22 @@ jobs:
         run: |
           set -e
 
-          # 构建用户消息内容（标题、描述、diff）到文件
-          cat > user_message.txt <<EOF
-          PR 标题：${{ github.event.pull_request.title }}
-          PR 描述：${{ github.event.pull_request.body }}
+          TITLE="${{ github.event.pull_request.title }}"
+          BODY="${{ github.event.pull_request.body }}"
+          DIFF_FILE="pr_trimmed.diff"
 
-          Diff:
-          ${{ steps.diff.outputs.content }}
-          EOF
-
-          # 使用 jq 构建请求体，--rawfile 读取文件内容
+          # 使用 jq 构建请求体，避免 shell 转义问题
           jq -n \
             --arg model "deepseek-v4-flash" \
             --arg system "你是一个代码审查专家。根据 PR 的 diff 判断是否允许合并，重点检查：逻辑错误、安全漏洞、破坏性变更。只返回 JSON：{\"allowed\": true/false, \"reason\": \"原因\"}" \
-            --rawfile user user_message.txt \
+            --arg title "$TITLE" \
+            --arg body "$BODY" \
+            --rawfile diff "$DIFF_FILE" \
             '{
               model: $model,
               messages: [
                 {role: "system", content: $system},
-                {role: "user", content: $user}
+                {role: "user", content: ("PR 标题：" + $title + "\nPR 描述：" + $body + "\n\nDiff:\n" + $diff)}
               ],
               temperature: 0.1,
               max_tokens: 256
@@ -90,17 +87,9 @@ jobs:
 
           if [ "$HTTP_CODE" -ne 200 ]; then
             echo "API调用失败，HTTP状态码: $HTTP_CODE"
-            echo "响应内容:"
             cat response_body
             echo "allowed=false" >> $GITHUB_OUTPUT
             echo "reason=DeepSeek API 调用失败 (HTTP $HTTP_CODE)" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          if [ ! -s response_body ]; then
-            echo "响应体为空"
-            echo "allowed=false" >> $GITHUB_OUTPUT
-            echo "reason=DeepSeek 返回空响应" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -115,7 +104,7 @@ jobs:
 
           CONTENT=$(jq -r '.choices[0].message.content // ""' response_body)
           if [ -z "$CONTENT" ]; then
-            echo "未获取到有效内容"
+            echo "内容为空"
             echo "allowed=false" >> $GITHUB_OUTPUT
             echo "reason=DeepSeek 返回内容为空" >> $GITHUB_OUTPUT
             exit 0
@@ -126,9 +115,9 @@ jobs:
 
           echo "allowed=$ALLOWED" >> $GITHUB_OUTPUT
           echo "reason=$REASON" >> $GITHUB_OUTPUT
-          echo "AI 审查结论: allowed=$ALLOWED, reason=$REASON"
+          echo "AI 结论: allowed=$ALLOWED, reason=$REASON"
 
-      - name: Set merge check status
+      - name: Set initial merge check status
         id: set_status
         uses: actions/github-script@v7
         with:
@@ -164,6 +153,7 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
 
+            // 1. 检查是否可合并
             const pr = await github.rest.pulls.get({
               owner,
               repo,
@@ -171,17 +161,39 @@ jobs:
             });
 
             if (pr.data.mergeable === false) {
-              core.setFailed('❌ PR has merge conflicts, cannot merge automatically.');
+              // 有冲突 → 将状态改为 failure
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha: context.payload.pull_request.head.sha,
+                state: 'failure',
+                description: 'PR has merge conflicts, cannot auto-merge.',
+                context: 'deepseek-merge-check'
+              });
+              core.setFailed('❌ PR has conflicts, auto-merge impossible.');
               return;
             }
 
-            await github.rest.pulls.merge({
-              owner,
-              repo,
-              pull_number: prNumber,
-              merge_method: 'merge',
-              commit_title: `Auto-merge: ${pr.data.title}`,
-              commit_message: `Merged automatically by DeepSeek AI review.`,
-            });
-
-            console.log(`✅ PR #${prNumber} merged automatically.`);
+            // 2. 尝试合并
+            try {
+              await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number: prNumber,
+                merge_method: 'merge',
+                commit_title: `Auto-merge: ${pr.data.title}`,
+                commit_message: `Merged automatically by DeepSeek AI review.`,
+              });
+              console.log(`✅ PR #${prNumber} merged successfully.`);
+            } catch (error) {
+              // 合并失败（例如意外冲突、权限等） → 状态改为 failure
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha: context.payload.pull_request.head.sha,
+                state: 'failure',
+                description: 'Auto-merge failed: ' + error.message.slice(0, 140),
+                context: 'deepseek-merge-check'
+              });
+              core.setFailed(`❌ Auto-merge failed: ${error.message}`);
+            }
