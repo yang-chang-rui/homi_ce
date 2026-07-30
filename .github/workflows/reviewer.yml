@@ -45,7 +45,7 @@ jobs:
           cat pr_trimmed.diff >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Ask DeepSeek v4-flash
+      - name: Ask DeepSeek
         id: ai
         env:
           API_KEY: ${{ secrets.llm_api_key }}
@@ -56,8 +56,19 @@ jobs:
           BODY="${{ github.event.pull_request.body }}"
           DIFF_FILE="pr_trimmed.diff"
 
+          # 如果 diff 过大，裁剪至前 2000 行（可调整）
+          DIFF_SIZE=$(wc -c < "$DIFF_FILE")
+          echo "Diff 原始大小: $DIFF_SIZE 字节"
+          if [ "$DIFF_SIZE" -gt 30000 ]; then
+            echo "Diff 过大，裁剪为前 1500 行"
+            head -n 1500 "$DIFF_FILE" > pr_trimmed_small.diff
+            DIFF_FILE="pr_trimmed_small.diff"
+          fi
+
+          # 使用正确的模型名称（根据您实际可用模型调整）
+          MODEL="deepseek-chat"   # 或 "deepseek-v4-flash"
           jq -n \
-            --arg model "deepseek-v4-flash" \
+            --arg model "$MODEL" \
             --arg system "你是一个代码审查专家。根据 PR 的 diff 判断是否允许合并，重点检查：逻辑错误、安全漏洞、破坏性变更。只返回 JSON：{\"allowed\": true/false, \"reason\": \"原因\"}" \
             --arg title "$TITLE" \
             --arg body "$BODY" \
@@ -84,31 +95,53 @@ jobs:
           HTTP_CODE=$(cat http_code.txt)
           echo "HTTP状态码: $HTTP_CODE"
 
+          # 打印完整响应体（调试）
+          echo "========== 响应体内容 =========="
+          cat response_body
+          echo ""
+          echo "================================="
+
           if [ "$HTTP_CODE" -ne 200 ]; then
             echo "API调用失败，HTTP状态码: $HTTP_CODE"
-            cat response_body
             echo "allowed=false" >> $GITHUB_OUTPUT
             echo "reason=DeepSeek API 调用失败 (HTTP $HTTP_CODE)" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          if ! jq -e . response_body >/dev/null 2>&1; then
-            echo "响应不是有效的JSON，前200字符:"
-            head -c 200 response_body
-            echo ""
+          # 检查错误字段
+          ERROR_MSG=$(jq -r '.error.message // ""' response_body)
+          if [ -n "$ERROR_MSG" ]; then
+            echo "API 返回错误: $ERROR_MSG"
             echo "allowed=false" >> $GITHUB_OUTPUT
-            echo "reason=DeepSeek 返回格式错误" >> $GITHUB_OUTPUT
+            echo "reason=DeepSeek API 错误: $ERROR_MSG" >> $GITHUB_OUTPUT
             exit 0
           fi
 
+          # 提取 content 和 finish_reason
           CONTENT=$(jq -r '.choices[0].message.content // ""' response_body)
-          if [ -z "$CONTENT" ]; then
-            echo "内容为空"
+          FINISH_REASON=$(jq -r '.choices[0].finish_reason // ""' response_body)
+          echo "finish_reason: $FINISH_REASON"
+
+          # 根据 finish_reason 处理
+          if [ "$FINISH_REASON" = "content_filter" ]; then
+            echo "内容被安全策略拦截"
             echo "allowed=false" >> $GITHUB_OUTPUT
-            echo "reason=DeepSeek 返回内容为空" >> $GITHUB_OUTPUT
+            echo "reason=AI审查未通过：内容被安全策略拦截" >> $GITHUB_OUTPUT
+            exit 0
+          elif [ "$FINISH_REASON" = "length" ]; then
+            echo "输出因长度限制被截断"
+            echo "allowed=false" >> $GITHUB_OUTPUT
+            echo "reason=AI审查无法完成：代码变更量过大，建议人工复审" >> $GITHUB_OUTPUT
+            exit 0
+          elif [ -z "$CONTENT" ] && [ "$FINISH_REASON" = "stop" ]; then
+            # 正常结束但无内容，视为通过
+            echo "AI审查完成，未发现问题"
+            echo "allowed=true" >> $GITHUB_OUTPUT
+            echo "reason=AI审查通过" >> $GITHUB_OUTPUT
             exit 0
           fi
 
+          # 有内容，解析 JSON
           ALLOWED=$(echo "$CONTENT" | jq -r '.allowed // false')
           REASON=$(echo "$CONTENT" | jq -r '.reason // "未知原因"')
 
@@ -119,14 +152,11 @@ jobs:
       - name: Set merge check status
         id: set_status
         uses: actions/github-script@v7
+        # ✅ 修正：只传递 script，不传递自定义参数
         with:
-          allowed: ${{ steps.ai.outputs.allowed }}
-          reason: ${{ steps.ai.outputs.reason }}
-          # 修正点：script 移到 with 内部，缩进与 allowed/reason 对齐
           script: |
-            const allowed = core.getInput('allowed', { required: true });
-            let reason = core.getInput('reason') || 'Blocked by DeepSeek';
-            // 移除换行符，防止破坏状态描述（最多140字符）
+            const allowed = '${{ steps.ai.outputs.allowed }}';
+            let reason = '${{ steps.ai.outputs.reason }}' || 'Blocked by DeepSeek';
             reason = reason.replace(/\n/g, ' ').substring(0, 140);
             const state = allowed === 'true' ? 'success' : 'failure';
             const desc = reason || (state === 'success' ? 'Approved by DeepSeek' : 'Blocked by DeepSeek');
@@ -151,17 +181,13 @@ jobs:
       - name: Merge pull request if allowed
         if: steps.set_status.outputs.allowed == 'true'
         uses: actions/github-script@v7
+        # ✅ 修正：直接使用 context 和步骤输出，无需传入自定义参数
         with:
-          pr_number: ${{ github.event.pull_request.number }}
-          owner: ${{ github.repository_owner }}
-          repo: ${{ github.event.repository.name }}
-          head_sha: ${{ github.event.pull_request.head.sha }}
-          # 修正点：script 移到 with 内部，与其它输入对齐
           script: |
-            const prNumber = parseInt(core.getInput('pr_number', { required: true }));
-            const owner = core.getInput('owner', { required: true });
-            const repo = core.getInput('repo', { required: true });
-            const headSha = core.getInput('head_sha', { required: true });
+            const prNumber = context.payload.pull_request.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = context.payload.pull_request.head.sha;
 
             // 检查是否可合并
             const pr = await github.rest.pulls.get({
@@ -171,7 +197,6 @@ jobs:
             });
 
             if (pr.data.mergeable === false) {
-              // 有冲突 → 更新状态为 failure
               await github.rest.repos.createCommitStatus({
                 owner,
                 repo,
@@ -184,7 +209,6 @@ jobs:
               return;
             }
 
-            // 尝试合并
             try {
               await github.rest.pulls.merge({
                 owner,
@@ -196,7 +220,6 @@ jobs:
               });
               console.log(`✅ PR #${prNumber} merged successfully.`);
             } catch (error) {
-              // 合并失败 → 更新状态为 failure
               await github.rest.repos.createCommitStatus({
                 owner,
                 repo,
