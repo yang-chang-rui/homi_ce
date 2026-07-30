@@ -56,7 +56,7 @@ jobs:
           BODY="${{ github.event.pull_request.body }}"
           DIFF_FILE="pr_trimmed.diff"
 
-          # 如果 diff 过大，裁剪至前 2000 行（可调整）
+          # 如果 diff 过大，裁剪至前 1500 行（避免超出上下文）
           DIFF_SIZE=$(wc -c < "$DIFF_FILE")
           echo "Diff 原始大小: $DIFF_SIZE 字节"
           if [ "$DIFF_SIZE" -gt 30000 ]; then
@@ -65,8 +65,9 @@ jobs:
             DIFF_FILE="pr_trimmed_small.diff"
           fi
 
-          # 使用正确的模型名称（根据您实际可用模型调整）
-          MODEL="deepseek-chat"   # 或 "deepseek-v4-flash"
+          # 请根据您实际可用的模型名称修改此处（常用：deepseek-chat）
+          MODEL="deepseek-v4-flash"
+
           jq -n \
             --arg model "$MODEL" \
             --arg system "你是一个代码审查专家。根据 PR 的 diff 判断是否允许合并，重点检查：逻辑错误、安全漏洞、破坏性变更。只返回 JSON：{\"allowed\": true/false, \"reason\": \"原因\"}" \
@@ -95,7 +96,7 @@ jobs:
           HTTP_CODE=$(cat http_code.txt)
           echo "HTTP状态码: $HTTP_CODE"
 
-          # 打印完整响应体（调试）
+          # 调试：打印完整响应体（生产时可注释掉）
           echo "========== 响应体内容 =========="
           cat response_body
           echo ""
@@ -122,7 +123,7 @@ jobs:
           FINISH_REASON=$(jq -r '.choices[0].finish_reason // ""' response_body)
           echo "finish_reason: $FINISH_REASON"
 
-          # 根据 finish_reason 处理
+          # 根据 finish_reason 处理特殊情况
           if [ "$FINISH_REASON" = "content_filter" ]; then
             echo "内容被安全策略拦截"
             echo "allowed=false" >> $GITHUB_OUTPUT
@@ -134,19 +135,29 @@ jobs:
             echo "reason=AI审查无法完成：代码变更量过大，建议人工复审" >> $GITHUB_OUTPUT
             exit 0
           elif [ -z "$CONTENT" ] && [ "$FINISH_REASON" = "stop" ]; then
-            # 正常结束但无内容，视为通过
+            # 正常结束但无内容，视为通过（例如无变更或全为注释）
             echo "AI审查完成，未发现问题"
             echo "allowed=true" >> $GITHUB_OUTPUT
             echo "reason=AI审查通过" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # 有内容，解析 JSON
-          ALLOWED=$(echo "$CONTENT" | jq -r '.allowed // false')
-          REASON=$(echo "$CONTENT" | jq -r '.reason // "未知原因"')
+          # 有内容，解析 JSON，并清理值（去除多余空格、换行、引号）
+          ALLOWED=$(echo "$CONTENT" | jq -r '.allowed // false' | tr -d ' \t\n\r"')
+          REASON=$(echo "$CONTENT" | jq -r '.reason // "未知原因"' | tr -d '\n\r' | cut -c1-140)
 
-          echo "allowed=$ALLOWED" >> $GITHUB_OUTPUT
-          echo "reason=$REASON" >> $GITHUB_OUTPUT
+          # 再次确保 allowed 是 true 或 false（防止意外）
+          if [ "$ALLOWED" != "true" ] && [ "$ALLOWED" != "false" ]; then
+            ALLOWED="false"
+            REASON="AI 返回格式异常，已拒绝"
+          fi
+
+          # 使用 heredoc 安全写入输出（防止值包含换行符导致格式错误）
+          {
+            echo "allowed=$ALLOWED"
+            echo "reason=$REASON"
+          } >> $GITHUB_OUTPUT
+
           echo "AI 结论: allowed=$ALLOWED, reason=$REASON"
 
       - name: Set merge check status
@@ -181,7 +192,7 @@ jobs:
       - name: Merge pull request if allowed
         if: steps.set_status.outputs.allowed == 'true'
         uses: actions/github-script@v7
-        # ✅ 修正：直接使用 context 和步骤输出，无需传入自定义参数
+        # ✅ 修正：直接使用 context，无需传入额外参数
         with:
           script: |
             const prNumber = context.payload.pull_request.number;
@@ -189,7 +200,6 @@ jobs:
             const repo = context.repo.repo;
             const headSha = context.payload.pull_request.head.sha;
 
-            // 检查是否可合并
             const pr = await github.rest.pulls.get({
               owner,
               repo,
