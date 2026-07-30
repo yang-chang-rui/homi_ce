@@ -1,23 +1,18 @@
-name: Build multi-arch .so and dependency installer for plugins
+name: Build multi-arch .so and deps installer
 
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
 
 permissions:
-  contents: write        # 用于推送生成的脚本和 .so
-  pull-requests: read    # 用于读取 PR 信息
+  contents: write
+  pull-requests: read
 
 jobs:
-  build-and-generate:
+  build-and-deploy:
     runs-on: ubuntu-22.04
 
-    strategy:
-      matrix:
-        arch: [x86_64, x86, arm64]   # 将三种架构并行编译，加快速度
-
     steps:
-      # ---------- 公共准备：检出代码 ----------
       - name: Checkout base
         uses: actions/checkout@v4
         with:
@@ -26,46 +21,154 @@ jobs:
       - name: Find plugin folders with changed .c files
         id: plugins
         run: |
-          # ...（与之前完全相同，略）...
-          # 注意：这一步我们只需在所有 matrix 中执行一次即可，
-          # 但因每个 job 独立，后面会重复运行。为简化，直接在 matrix 中执行，
-          # 但最终只有一次提交。我们可改为在一个前置 job 中计算文件夹，
-          # 然后传递给编译 job。为保持示例简洁，这里允许每个 arch 都运行检测。
-          # 实际使用建议拆分 job。
+          set -e
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
 
-      # ---------- 安装交叉编译工具链（不同架构不同） ----------
-      - name: Setup cross-compilation tools
+          if git fetch --no-tags --prune origin "pull/${PR_NUMBER}/head:pr_head"; then
+            DIFF_RANGE="$BASE_SHA..pr_head"
+          else
+            git fetch --no-tags --prune origin "${{ github.event.pull_request.head.sha }}" || true
+            DIFF_RANGE="$BASE_SHA..${{ github.event.pull_request.head.sha }}"
+          fi
+
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACMR "$DIFF_RANGE" -- 'homi_ce/plugin/*/**.c' || true)
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "folders=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          FOLDERS=$(echo "$CHANGED_FILES" | xargs -I {} dirname {} | sort -u)
+          FOLDERS_JSON=$(echo "$FOLDERS" | jq -R -s -c 'split("\n")[:-1]')
+          echo "folders=$FOLDERS_JSON" >> $GITHUB_OUTPUT
+
+      - name: Early exit if no changes
+        if: steps.plugins.outputs.folders == '[]'
+        run: echo "No plugin .c files changed."
+
+      - name: Install cross-compilation toolchains
+        if: steps.plugins.outputs.folders != '[]'
         run: |
           sudo apt-get update
-          case "${{ matrix.arch }}" in
-            x86_64)
-              sudo apt-get install -y gcc
-              ;;
-            x86)
-              sudo dpkg --add-architecture i386
-              sudo apt-get update
-              sudo apt-get install -y gcc-multilib g++-multilib libc6-dev:i386
-              ;;
-            arm64)
-              sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
-              ;;
-          esac
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib libc6-dev:i386
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
 
-      # ---------- 为所有架构安装通用依赖（由 AI 提供） ----------
-      # 注意：这里我们需要先调用 AI 获得依赖包列表并安装，
-      # 但 install_deps.sh 的生成我们也要保留。因此重构步骤：
-      # 1. 获取 C 源码
-      # 2. 调用 AI，返回 JSON（包含依赖包列表 + install_deps.sh 脚本）
-      # 3. 根据依赖包列表安装开发包（同时安装对应架构的版本）
-      # 4. 编译 .so
-      # 5. 收集产物
-      # 由于 matrix 会重复执行 AI 调用，可在后续做合并优化，这里简化为每个 arch 都独立分析。
-      # 一个更优的方案：用单个 job 分析依赖并安装，然后编译，三种架构在一个 job 中顺序或并行编译。
-      # 但为展示结构，这里保留矩阵，但需注意文件同步问题。推荐实际使用时采用单个 job + 多架构编译。
-      # 下面先给出单个 job 的版本（推荐）。
+      - name: Process each plugin folder
+        if: steps.plugins.outputs.folders != '[]'
+        env:
+          API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -e
+          FOLDERS='${{ steps.plugins.outputs.folders }}'
+          echo "$FOLDERS" | jq -r '.[]' | while read folder; do
+            echo "::group::Processing $folder"
 
-# 推荐的单 job 版本（不使用 matrix，在一个 runner 中完成所有架构编译）：
-jobs:
-  build-all-arch:
-    runs-on: ubuntu-22.04
-    # ... 后续步骤
+            git checkout pr_head 2>/dev/null || git checkout "${{ github.event.pull_request.head.sha }}"
+
+            PLUGIN_NAME=$(basename "$folder")
+            C_FILES=$(find "$folder" -maxdepth 1 -name "*.c" -type f)
+            if [ -z "$C_FILES" ]; then
+              echo "No .c files in $folder, skipping."
+              git checkout -
+              continue
+            fi
+
+            C_CONTENT=""
+            for f in $C_FILES; do
+              C_CONTENT+="// File: $f
+            $(cat "$f")
+
+            "
+            done
+
+            SYSTEM_PROMPT="You are a system engineer. Analyze the following C plugin source code and find all non-standard #include <...> directives (ignore standard headers like stdio.h, stdlib.h, string.h, etc.).
+            Then do two things:
+            1. List the corresponding Ubuntu 22.04 development package names (ending with -dev) separated by commas on the first line.
+            2. Generate a bash script (starting from the second line) that automatically detects the Linux distribution (Ubuntu/Debian, CentOS/RHEL, Alpine, Arch) and uses the native package manager to install those development packages.
+            Important:
+            - The script must start with #!/bin/bash.
+            - Do not use sudo.
+            - Output only the requested content, no explanations or markdown formatting.
+            - Package names must be accurate, provide alternatives if unsure."
+
+            jq -n \
+              --arg model "deepseek-chat" \
+              --arg system "$SYSTEM_PROMPT" \
+              --arg ccode "$C_CONTENT" \
+              '{
+                model: $model,
+                messages: [
+                  {role: "system", content: $system},
+                  {role: "user", content: ("C source code:\n" + $ccode)}
+                ],
+                temperature: 0.1,
+                max_tokens: 1500
+              }' > request.json
+
+            for i in 1 2; do
+              curl -s --max-time 60 -o response_body -w "%{http_code}" \
+                https://api.deepseek.com/v1/chat/completions \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $API_KEY" \
+                -d @request.json > http_code.txt
+              HTTP_CODE=$(cat http_code.txt)
+              if [ "$HTTP_CODE" -eq 200 ]; then break; fi
+              if [ $i -eq 2 ]; then
+                echo "API failed, skipping $folder"; continue 2
+              fi
+              sleep 2
+            done
+
+            CONTENT=$(jq -r '.choices[0].message.content // ""' response_body)
+            if [ -z "$CONTENT" ]; then echo "Empty AI response, skipping."; continue; fi
+
+            DEPS_LINE=$(echo "$CONTENT" | head -n1)
+            SCRIPT_BODY=$(echo "$CONTENT" | tail -n +2)
+
+            if echo "$SCRIPT_BODY" | grep -q '```'; then
+              SCRIPT_BODY=$(echo "$SCRIPT_BODY" | sed -n '/```bash/,/```/p' | sed '1d;$d')
+            fi
+
+            if [[ ! "$SCRIPT_BODY" =~ ^#!/bin/bash ]]; then
+              SCRIPT_BODY="#!/bin/bash
+            $SCRIPT_BODY"
+            fi
+
+            DEPS=$(echo "$DEPS_LINE" | tr ',' ' ')
+            if [ -n "$DEPS" ]; then
+              echo "Installing dependencies: $DEPS"
+              sudo apt-get install -y $DEPS || echo "Some packages might not exist, continuing..."
+            fi
+
+            SRC_FILES=$(echo $C_FILES | tr '\n' ' ')
+
+            echo "Compiling $PLUGIN_NAME for x86_64..."
+            gcc -shared -fPIC -o "$folder/${PLUGIN_NAME}.so.x86_64" $SRC_FILES -Wall
+
+            echo "Compiling $PLUGIN_NAME for x86 (32-bit)..."
+            gcc -m32 -shared -fPIC -o "$folder/${PLUGIN_NAME}.so.x86" $SRC_FILES -Wall
+
+            echo "Compiling $PLUGIN_NAME for arm64..."
+            aarch64-linux-gnu-gcc -shared -fPIC -o "$folder/${PLUGIN_NAME}.so.arm64" $SRC_FILES -Wall
+
+            echo "$SCRIPT_BODY" > "$folder/install_deps.sh"
+            chmod +x "$folder/install_deps.sh"
+
+            git checkout -
+            git checkout pr_head 2>/dev/null || git checkout "${{ github.event.pull_request.head.sha }}"
+            git add "$folder/${PLUGIN_NAME}.so.x86_64" "$folder/${PLUGIN_NAME}.so.x86" "$folder/${PLUGIN_NAME}.so.arm64" "$folder/install_deps.sh"
+            git commit -m "Add multi-arch .so and deps installer for $PLUGIN_NAME" || echo "Nothing to commit for $folder"
+            git checkout -
+            echo "::endgroup::"
+          done
+
+      - name: Push generated files to PR branch
+        if: steps.plugins.outputs.folders != '[]'
+        run: |
+          git checkout pr_head 2>/dev/null || git checkout "${{ github.event.pull_request.head.sha }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git push origin HEAD:"${{ github.event.pull_request.head.ref }}"
