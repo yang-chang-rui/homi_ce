@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       statuses: write
-      pull-requests: write  # 如需自动启用 auto-merge
+      pull-requests: write   # 用于启用 auto-merge
 
     steps:
       - name: Checkout
@@ -17,10 +17,33 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get PR diff using SHA
+      # === 修复 diff 获取的核心步骤 ===
+      - name: Get PR diff using SHA (with fallback)
         id: diff
         run: |
-          git diff ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} > pr.diff
+          set -e
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          # 1. 确保 base 存在
+          git fetch --no-tags --prune origin "$BASE_SHA" || true
+
+          # 2. 尝试通过 refs/pull/N/head 获取 HEAD（对 fork 有效）
+          if git fetch --no-tags --prune origin "pull/${PR_NUMBER}/head:pr_head"; then
+            DIFF_RANGE="$BASE_SHA..pr_head"
+          else
+            # 回退：直接尝试拉取 head SHA（可能已在本地）
+            git fetch --no-tags --prune origin "$HEAD_SHA" || true
+            if git rev-parse --verify --quiet "$HEAD_SHA" >/dev/null; then
+              DIFF_RANGE="$BASE_SHA..$HEAD_SHA"
+            else
+              echo "Error: Cannot fetch PR head (pr #${PR_NUMBER}, sha ${HEAD_SHA})"
+              exit 1
+            fi
+          fi
+
+          git diff "$DIFF_RANGE" > pr.diff
           head -n 5000 pr.diff > pr_trimmed.diff
           echo "content<<EOF" >> $GITHUB_OUTPUT
           cat pr_trimmed.diff >> $GITHUB_OUTPUT
@@ -71,8 +94,6 @@ jobs:
             echo "reason=DeepSeek API 调用失败 (HTTP $HTTP_CODE)" >> $GITHUB_OUTPUT
             exit 0
           fi
-
-          echo "响应体大小: $(wc -c < response_body) 字节"
 
           if [ ! -s response_body ]; then
             echo "响应体为空"
