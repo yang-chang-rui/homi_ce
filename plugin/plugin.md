@@ -5,6 +5,9 @@
 ## 🛠️ To All Developers
 Thank you for creating various plugins for Homi. Your passion, skill, and hard work have pushed the project far beyond its original boundaries. Every line of code and every debug session reflects your dedication.
 
+## 🔌If You Want To Make A Plugin
+Please make a folder and make arm64,x86_64,x86's .so fill in this folder.Very thanks!
+
 ## 📁 How to Contribute a Plugin
 If you'd like to add new features to Homi, simply upload your **C source code** to the `plugin` directory in the repository. GitHub Actions will automatically compile it into `.so` shared libraries for **arm64**, **x86**, and **x86_64** architectures, making it easy for users on different platforms to load your plugin right away.
 
